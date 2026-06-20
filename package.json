@@ -1,0 +1,19 @@
+{
+  "name": "whatsapp-baileys-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp bot using Baileys with pairing-code login, Gemini AI (Roman Urdu), appointment booking and Google Calendar integration.",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "@whiskeysockets/baileys": "^6.7.9",
+    "googleapis": "^144.0.0",
+    "pino": "^9.5.0"
+  }
+}
