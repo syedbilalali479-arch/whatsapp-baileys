@@ -52,6 +52,21 @@ const REFRESH_MS = 55 * 1000;
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'silent' });
 
+// Build the ordered list of number formats to try for requestPairingCode().
+// #1 (full international, no +) is the correct one for Baileys; the local
+// variants are fallbacks in case the first throws "check the phone number".
+function pairingNumberCandidates() {
+  const full = PAIRING_NUMBER; // already digits-only, e.g. 923008631270
+  const candidates = [full];
+  if (full.startsWith('92')) {
+    const local = full.slice(2);       // 3008631270
+    candidates.push('0' + local);      // 03008631270
+    candidates.push(local);            // 3008631270
+  }
+  // de-duplicate while preserving order, drop empties
+  return [...new Set(candidates)].filter(Boolean);
+}
+
 // ----------------------------------------------------------------------------
 // Live linking state (shared with the /qr web page)
 // ----------------------------------------------------------------------------
@@ -291,22 +306,38 @@ async function startBot() {
 
   async function requestPairing() {
     if (sock.authState.creds.registered || !PAIRING_NUMBER) return;
-    try {
-      const code = await sock.requestPairingCode(PAIRING_NUMBER);
-      const pretty = code?.match(/.{1,4}/g)?.join('-') || code;
-      link.pairingCode = pretty;
-      link.updatedAt = new Date();
-      console.log('\n==============================================');
-      console.log('   📲 WHATSAPP PAIRING CODE (refreshes every 55s)');
-      console.log(`   Number : +${PAIRING_NUMBER}`);
-      console.log(`   CODE   : ${pretty}`);
-      console.log('==============================================');
-      console.log('   WhatsApp > Linked Devices > Link a Device');
-      console.log('   > Link with phone number instead > enter code');
-      console.log('==============================================\n');
-    } catch (err) {
-      console.error('❌ Failed to get pairing code:', err?.message || err);
+
+    const candidates = pairingNumberCandidates();
+    let lastErr = null;
+
+    for (const num of candidates) {
+      console.log(`🔢 Trying requestPairingCode() with number: "${num}"`);
+      try {
+        const code = await sock.requestPairingCode(num);
+        const pretty = code?.match(/.{1,4}/g)?.join('-') || code;
+        link.pairingCode = pretty;
+        link.updatedAt = new Date();
+        console.log('\n==============================================');
+        console.log('   📲 WHATSAPP PAIRING CODE (refreshes every 55s)');
+        console.log(`   Number used : ${num}`);
+        console.log(`   CODE        : ${pretty}`);
+        console.log('==============================================');
+        console.log('   WhatsApp > Linked Devices > Link a Device');
+        console.log('   > Link with phone number instead > enter code');
+        console.log('==============================================\n');
+        return; // success — stop trying other formats
+      } catch (err) {
+        lastErr = err;
+        console.error(`   ❌ Format "${num}" failed: ${err?.message || err}`);
+      }
     }
+
+    console.error(
+      `❌ All number formats failed [${candidates.join(', ')}]. ` +
+        `Make sure PAIRING_NUMBER is a real WhatsApp number in full international ` +
+        `format (e.g. 923008631270), then delete ${AUTH_DIR} and retry. ` +
+        `Last error: ${lastErr?.message || lastErr}`
+    );
   }
 
   function stopRefreshers() {
