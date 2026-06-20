@@ -7,8 +7,9 @@
  *   - Appointment booking flow
  *   - Google Calendar integration (service account)
  *
- * Login uses a PAIRING CODE (no QR / no camera needed).
- * The pairing code is printed to the logs (visible in Railway logs).
+ * Login: a PAIRING CODE is printed to the logs (refreshed every ~55s), and a
+ * scannable QR is served at the /qr route (page auto-refreshes every 30s).
+ * Both stay current until the device is linked — no manual restart needed.
  *
  * Required environment variables:
  *   GEMINI_KEY          - Google Gemini API key
@@ -26,6 +27,8 @@ const {
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
+const http = require('http');
+const QRCode = require('qrcode');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { google } = require('googleapis');
 
@@ -41,8 +44,24 @@ const TIMEZONE = process.env.TIMEZONE || 'Asia/Karachi';
 // survives redeploys/restarts and pairing is only ever needed once.
 // Override locally with AUTH_DIR=auth_info (relative path) if /app is not writable.
 const AUTH_DIR = process.env.AUTH_DIR || '/app/auth_info';
+const PORT = process.env.PORT || 3000;
+
+// How often to refresh the linking credentials (ms). 55s = just under the
+// ~60s WhatsApp expiry, so a fresh QR / pairing code is always ready.
+const REFRESH_MS = 55 * 1000;
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'silent' });
+
+// ----------------------------------------------------------------------------
+// Live linking state (shared with the /qr web page)
+// ----------------------------------------------------------------------------
+const link = {
+  connected: false,
+  qrString: null,     // raw QR payload from Baileys
+  qrDataUrl: null,    // QR rendered as a PNG data URL for the web page
+  pairingCode: null,  // latest pairing code
+  updatedAt: null,
+};
 
 if (!GEMINI_KEY) console.warn('⚠️  GEMINI_KEY is not set — AI replies will be disabled.');
 if (!PAIRING_NUMBER) console.warn('⚠️  PAIRING_NUMBER is not set — pairing code cannot be requested.');
@@ -256,7 +275,8 @@ async function startBot() {
   const sock = makeWASocket({
     version,
     logger,
-    printQRInTerminal: false, // pairing code instead of QR
+    printQRInTerminal: false, // we serve QR ourselves at /qr
+    qrTimeout: REFRESH_MS,     // make Baileys emit a fresh QR every ~55s
     auth: {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger),
@@ -264,38 +284,75 @@ async function startBot() {
     browser: ['WA Bot', 'Chrome', '1.0.0'],
   });
 
-  // Request pairing code if this device is not yet registered.
+  // ---- Pairing code: request a fresh one every ~55s until linked ----------
+  // Each request stays valid ~1 hour on WhatsApp's side, but we keep issuing
+  // new ones so a current code is always in the logs (and on the /qr page).
+  let pairingTimer = null;
+
+  async function requestPairing() {
+    if (sock.authState.creds.registered || !PAIRING_NUMBER) return;
+    try {
+      const code = await sock.requestPairingCode(PAIRING_NUMBER);
+      const pretty = code?.match(/.{1,4}/g)?.join('-') || code;
+      link.pairingCode = pretty;
+      link.updatedAt = new Date();
+      console.log('\n==============================================');
+      console.log('   📲 WHATSAPP PAIRING CODE (refreshes every 55s)');
+      console.log(`   Number : +${PAIRING_NUMBER}`);
+      console.log(`   CODE   : ${pretty}`);
+      console.log('==============================================');
+      console.log('   WhatsApp > Linked Devices > Link a Device');
+      console.log('   > Link with phone number instead > enter code');
+      console.log('==============================================\n');
+    } catch (err) {
+      console.error('❌ Failed to get pairing code:', err?.message || err);
+    }
+  }
+
+  function stopRefreshers() {
+    if (pairingTimer) {
+      clearInterval(pairingTimer);
+      pairingTimer = null;
+    }
+  }
+
   if (!sock.authState.creds.registered) {
     if (!PAIRING_NUMBER) {
       console.error('❌ PAIRING_NUMBER not set — cannot request a pairing code.');
     } else {
-      // small delay so the socket is ready before requesting the code
-      setTimeout(async () => {
-        try {
-          const code = await sock.requestPairingCode(PAIRING_NUMBER);
-          const pretty = code?.match(/.{1,4}/g)?.join('-') || code;
-          console.log('\n==============================================');
-          console.log('   📲 WHATSAPP PAIRING CODE');
-          console.log(`   Number : +${PAIRING_NUMBER}`);
-          console.log(`   CODE   : ${pretty}`);
-          console.log('==============================================');
-          console.log('   WhatsApp > Linked Devices > Link a Device');
-          console.log('   > Link with phone number instead > enter code');
-          console.log('==============================================\n');
-        } catch (err) {
-          console.error('❌ Failed to get pairing code:', err?.message || err);
-        }
-      }, 3000);
+      // first request after a short delay, then refresh on an interval
+      setTimeout(requestPairing, 3000);
+      pairingTimer = setInterval(requestPairing, REFRESH_MS);
     }
   }
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update;
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    // Fresh QR emitted by Baileys (auto every ~55s via qrTimeout) — render it.
+    if (qr) {
+      link.qrString = qr;
+      link.updatedAt = new Date();
+      try {
+        link.qrDataUrl = await QRCode.toDataURL(qr, { margin: 1, width: 320 });
+        console.log(`🔄 New QR generated — open http://localhost:${PORT}/qr`);
+      } catch (err) {
+        console.error('QR render error:', err?.message || err);
+      }
+    }
+
     if (connection === 'open') {
       console.log('✅ WhatsApp connected!');
+      link.connected = true;
+      link.qrString = null;
+      link.qrDataUrl = null;
+      link.pairingCode = null;
+      stopRefreshers();
     } else if (connection === 'close') {
+      link.connected = false;
+      stopRefreshers();
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       console.log(`Connection closed (code ${statusCode}). Reconnecting: ${shouldReconnect}`);
@@ -335,4 +392,61 @@ async function startBot() {
   return sock;
 }
 
+// ----------------------------------------------------------------------------
+// Web server — /qr page (auto-refreshes every 30s to show a fresh QR / code)
+// ----------------------------------------------------------------------------
+function qrPageHtml() {
+  if (link.connected) {
+    return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WhatsApp Bot</title></head>
+<body style="font-family:sans-serif;text-align:center;padding:40px;background:#0b141a;color:#e9edef">
+<h1>✅ Connected</h1><p>WhatsApp bot is linked and running.</p></body></html>`;
+  }
+
+  const qrBlock = link.qrDataUrl
+    ? `<img src="${link.qrDataUrl}" alt="WhatsApp QR" style="width:320px;height:320px;background:#fff;padding:8px;border-radius:12px">`
+    : `<p style="opacity:.7">Generating QR… (refresh in a few seconds)</p>`;
+
+  const codeBlock = link.pairingCode
+    ? `<div style="margin-top:24px">
+         <p style="opacity:.7;margin:0">Or link with phone number — pairing code:</p>
+         <div style="font-size:32px;letter-spacing:4px;font-weight:700;margin-top:8px">${link.pairingCode}</div>
+       </div>`
+    : '';
+
+  const stamp = link.updatedAt ? link.updatedAt.toLocaleTimeString() : '—';
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="30">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scan WhatsApp QR</title></head>
+<body style="font-family:sans-serif;text-align:center;padding:32px;background:#0b141a;color:#e9edef">
+<h1>📲 Link WhatsApp</h1>
+<p style="opacity:.7">WhatsApp &gt; Linked Devices &gt; Link a Device</p>
+${qrBlock}
+${codeBlock}
+<p style="opacity:.5;margin-top:24px;font-size:13px">Auto-refreshes every 30s • last update ${stamp}</p>
+</body></html>`;
+}
+
+function startWebServer() {
+  http
+    .createServer((req, res) => {
+      const url = (req.url || '/').split('?')[0];
+      if (url === '/qr' || url === '/') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(qrPageHtml());
+      } else if (url === '/status') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ connected: link.connected, hasQr: !!link.qrDataUrl, pairingCode: link.pairingCode }));
+      } else {
+        res.writeHead(404);
+        res.end('Not found');
+      }
+    })
+    .listen(PORT, () => console.log(`🌐 Web server on :${PORT} — QR page at /qr`));
+}
+
+startWebServer();
 startBot().catch((err) => console.error('Fatal startup error:', err));
