@@ -25,6 +25,7 @@ const {
   makeCacheableSignalKeyStore,
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
+const fs = require('fs');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { google } = require('googleapis');
 
@@ -35,6 +36,11 @@ const GEMINI_KEY = process.env.GEMINI_KEY;
 const CALENDAR_ID = process.env.CALENDAR_ID;
 const PAIRING_NUMBER = (process.env.PAIRING_NUMBER || '').replace(/[^0-9]/g, '');
 const TIMEZONE = process.env.TIMEZONE || 'Asia/Karachi';
+
+// Session storage. On Railway, mount a Volume at this path so the session
+// survives redeploys/restarts and pairing is only ever needed once.
+// Override locally with AUTH_DIR=auth_info (relative path) if /app is not writable.
+const AUTH_DIR = process.env.AUTH_DIR || '/app/auth_info';
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'silent' });
 
@@ -230,7 +236,21 @@ async function handleMessage(jid, text, phone) {
 // WhatsApp connection (Baileys) with pairing code
 // ----------------------------------------------------------------------------
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+  // Ensure the session folder exists (Railway Volume mount point or local path).
+  if (!fs.existsSync(AUTH_DIR)) {
+    fs.mkdirSync(AUTH_DIR, { recursive: true });
+    console.log(`📁 Created session folder: ${AUTH_DIR}`);
+  }
+
+  // Loads an existing session from AUTH_DIR if present (no re-pairing needed),
+  // otherwise starts fresh. saveCreds persists creds on every update below.
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const alreadyPaired = state.creds.registered;
+  console.log(
+    alreadyPaired
+      ? `🔐 Existing session loaded from ${AUTH_DIR} — no pairing needed.`
+      : `🆕 No saved session in ${AUTH_DIR} — pairing code will be requested.`
+  );
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
@@ -280,7 +300,7 @@ async function startBot() {
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       console.log(`Connection closed (code ${statusCode}). Reconnecting: ${shouldReconnect}`);
       if (shouldReconnect) startBot();
-      else console.log('❌ Logged out. Delete the auth_info folder and re-pair.');
+      else console.log(`❌ Logged out. Delete the ${AUTH_DIR} folder and re-pair.`);
     }
   });
 

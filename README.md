@@ -38,13 +38,22 @@ Watch the logs for the **pairing code**, then on your phone:
 4. Copy the **Calendar ID** into `CALENDAR_ID`.
 5. Paste the entire JSON key into `GOOGLE_CREDENTIALS`.
 
-## Deploy on Railway
+## Deploy on Railway (with persistent session)
 1. Push this repo to GitHub.
 2. Railway → **New Project → Deploy from GitHub repo**.
 3. Add the environment variables above in **Variables**.
-4. Railway runs the `worker` process from the `Procfile`.
-5. Open the **deploy logs** to read the pairing code and link your phone.
+4. **Add a Volume** and set the **Mount path** to `/app/auth_info`.
+   This is where the WhatsApp session is stored (see `AUTH_DIR` in `index.js`).
+5. Railway runs the `worker` process from the `Procfile`.
+6. Open the **deploy logs** to read the pairing code and link your phone — **one time only**.
 
-> ⚠️ Railway's filesystem is ephemeral. The `auth_info/` session is lost on redeploy, so you may
-> need to re-pair after each deploy. For persistence, attach a Railway **Volume** mounted where
-> `auth_info` is stored, or move the auth state to a database.
+### Why the Volume matters
+The session is saved to `/app/auth_info` (`useMultiFileAuthState`), and creds are persisted on
+every `creds.update`. With a Volume mounted there:
+- ✅ Pair only once
+- ✅ Session survives redeploys
+- ✅ Session survives restarts/crashes
+- ✅ Auto-reconnects without re-pairing
+
+> Local dev: set `AUTH_DIR=auth_info` (a relative path) since `/app` may not be writable on your
+> machine. Default is `/app/auth_info` for Railway.
